@@ -1,4 +1,4 @@
-#define _CRT_SECURE_NO_WARNINGS
+#define _CRT_SECURE_NO_WARNINGS // to suppress warnings related to the use of older, less secure C runtime library functions.
 #include "proxy_parse.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -275,8 +275,10 @@ int checkHTTPversion(char *msg)
 	return -1;
 }
 
+// used when the client sends a CONNECT request (typically for HTTPS, like CONNECT www.google.com:443 HTTP/1.1).
 int handle_connect_request(SOCKET clientSocket, ParsedRequest *request)
 {
+	// extract host and port from the request
 	char *host = request->host;
 	int port = 443; // Default HTTPS port
 
@@ -286,6 +288,8 @@ int handle_connect_request(SOCKET clientSocket, ParsedRequest *request)
 	}
 
 	printf("Connecting to HTTPS server: %s:%d\n", host, port);
+	// Call helper function to connect to remote server (defined later).
+	// It does DNS resolution and TCP socket connection.
 	SOCKET remoteSocket = connectRemoteServer(host, port);
 	if (remoteSocket == INVALID_SOCKET)
 	{
@@ -303,6 +307,9 @@ int handle_connect_request(SOCKET clientSocket, ParsedRequest *request)
 
 	// Set up non-blocking mode for both sockets
 	u_long mode = 1;
+	// ioctlsocket() is used to control the I/O mode of a socket
+	// You're managing multiple sockets simultaneously (e.g. in a proxy, chat server, or multiplayer game).
+	// You don’t want one socket to delay the whole program. This means recv() and send() won’t wait; they just return immediately.
 	ioctlsocket(clientSocket, FIONBIO, &mode);
 	ioctlsocket(remoteSocket, FIONBIO, &mode);
 
@@ -366,21 +373,32 @@ int handle_connect_request(SOCKET clientSocket, ParsedRequest *request)
 	return 0;
 }
 
+// This is a thread function — which means it's executed in a separate thread for each client that connects.
+
 DWORD WINAPI thread_fn(LPVOID socketNew)
 {
-	WaitForSingleObject(semaphore, INFINITE);
+	WaitForSingleObject(semaphore, INFINITE); // Wait for semaphore to be available , like sem_wait in POSIX
 
+	// *() dereferences the pointer to get the actual SOCKET value.
+	// Now socket is the handle to the connected client — we'll use this to send/receive data.
 	SOCKET socket = *(SOCKET *)socketNew;
 	int bytes_send_client, len;
 
+	// Allocate buffer for receiving data from the client
+	// MAX_BYTES is defined as 4096, so we allocate that much memory.
 	char *buffer = (char *)calloc(MAX_BYTES, sizeof(char));
 	if (!buffer)
 	{
-		ReleaseSemaphore(semaphore, 1, NULL);
+		ReleaseSemaphore(semaphore, 1, NULL); // Release the semaphore if allocation fails
+		printf("Failed to allocate buffer\n");
 		return 1;
 	}
 
 	ZeroMemory(buffer, MAX_BYTES);
+	// Receive data from the client
+	// recv() is a blocking call that waits for data to be received on the socket.
+	// MAX_BYTES - 1 ensures space for null-terminator (C strings need it).
+	// bytes_send_client stores how many bytes were received.
 	bytes_send_client = recv(socket, buffer, MAX_BYTES - 1, 0);
 
 	if (bytes_send_client > 0)
@@ -410,7 +428,8 @@ DWORD WINAPI thread_fn(LPVOID socketNew)
 		strncpy(tempReq, buffer, req_len);
 		tempReq[req_len] = '\0';
 
-		// Check for GET /example.com HTTP/1.1 with Host: localhost
+		// Check if the request is a GET request and contains "Host: localhost" or "Host:
+		// convert "GET /example.com HTTP/1.1" to "GET http://example.com/ HTTP/1.1"
 		if (strncmp(buffer, "GET /", 5) == 0)
 		{
 			char *host_header = strstr(buffer, "Host: ");
@@ -439,6 +458,60 @@ DWORD WINAPI thread_fn(LPVOID socketNew)
 		}
 
 		ParsedRequest *request = ParsedRequest_create();
+		// Handle CONNECT method for HTTPS , The browser wants to open a tunnel.
+		if (strncmp(buffer, "CONNECT ", 8) == 0)
+		{
+			char *host_start = buffer + 8;
+			char *host_end = strchr(host_start, ' ');
+			if (!host_end)
+			{
+				sendErrorMessage(socket, 400);
+				free(buffer);
+				ReleaseSemaphore(semaphore, 1, NULL);
+				return 1;
+			}
+
+			*host_end = '\0';
+
+			char *colon = strchr(host_start, ':');
+			if (!colon)
+			{
+				sendErrorMessage(socket, 400);
+				free(buffer);
+				ReleaseSemaphore(semaphore, 1, NULL);
+				return 1;
+			}
+
+			*colon = '\0';
+			char *host = host_start;
+			char *port = colon + 1;
+
+			ParsedRequest *request = ParsedRequest_create();
+			request->method = strdup("CONNECT");
+			request->host = strdup(host);
+			request->port = strdup(port);
+			request->version = strdup("HTTP/1.1");
+
+			if (checkHTTPversion(request->version) == 1)
+			{
+				if (handle_connect_request(socket, request) == -1)
+				{
+					sendErrorMessage(socket, 502);
+				}
+			}
+			else
+			{
+				sendErrorMessage(socket, 400);
+			}
+
+			ParsedRequest_destroy(request);
+			free(buffer);
+			ReleaseSemaphore(semaphore, 1, NULL);
+			return 0;
+		}
+
+		// Parsing the request , to get method, host, port, path, version, etc.
+		// ParsedRequest_create() allocates memory for a ParsedRequest structure.
 		if (ParsedRequest_parse(request, buffer, len) < 0)
 		{
 			printf("Parsing failed\n");
@@ -451,7 +524,8 @@ DWORD WINAPI thread_fn(LPVOID socketNew)
 
 		printf("Received %s request for %s:%s%s\n", request->method, request->host, request->port ? request->port : "80", request->path);
 
-		// Special handling for GET /example.com HTTP/1.1 with Host: localhost
+		// Special handling for GET /example.com/parts HTTP/1.1 with Host: localhost
+		// strcmp == 0 if the strings are equal
 		if (strcmp(request->method, "GET") == 0 &&
 			(strcmp(request->host, "localhost") == 0 || strcmp(request->host, "127.0.0.1") == 0) &&
 			request->path && strlen(request->path) > 1 && request->path[0] == '/' &&
@@ -482,29 +556,15 @@ DWORD WINAPI thread_fn(LPVOID socketNew)
 			printf("Rewritten request: GET http://%s/\n", request->host);
 		}
 
-		// Handle CONNECT method for HTTPS
-		if (strcmp(request->method, "CONNECT") == 0)
+		if (strcmp(request->method, "GET") == 0)
 		{
-			if (request->host && checkHTTPversion(request->version) == 1)
-			{
-				if (handle_connect_request(socket, request) == -1)
-				{
-					sendErrorMessage(socket, 502);
-				}
-			}
-			else
-			{
-				sendErrorMessage(socket, 400);
-			}
-		}
-		// Handle GET method for HTTP
-		else if (strcmp(request->method, "GET") == 0)
-		{
+			// Check if the request is already in cache
 			struct cache_element *temp = find(tempReq);
 			if (temp != NULL)
 			{
 				int size = temp->len;
 				int pos = 0;
+				// Send the cached data to the client in chunks
 				while (pos < size)
 				{
 					int chunk_size = (size - pos < MAX_BYTES) ? (size - pos) : MAX_BYTES;
@@ -517,6 +577,7 @@ DWORD WINAPI thread_fn(LPVOID socketNew)
 			{
 				if (request->host && request->path && checkHTTPversion(request->version) == 1)
 				{
+					// Handle the GET request by forwarding it to the remote server
 					handle_request(socket, request, tempReq);
 				}
 				else
@@ -544,17 +605,20 @@ DWORD WINAPI thread_fn(LPVOID socketNew)
 
 int main(int argc, char *argv[])
 {
-	WSADATA wsaData;
+	// start Winsock
+	WSADATA wsaData; // Declares a structure to hold information about the Windows Sockets implementation.
 	if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0)
 	{
 		printf("WSAStartup failed: %d\n", WSAGetLastError());
 		return 1;
 	}
 
-	SOCKET client_socketId;
-	int client_len;
+	SOCKET client_socketId; // Will hold the accepted client connection.
+	int client_len;			// Length of client_addr
+	// server --> Info about the proxy itself (its IP/port). , client --> Info about the client (its IP/port).
 	struct sockaddr_in server_addr, client_addr;
 
+	// Create a semaphore to limit the number of concurrent connections.
 	semaphore = CreateSemaphore(NULL, MAX_CLIENTS, MAX_CLIENTS, NULL);
 	if (semaphore == NULL)
 	{
@@ -563,11 +627,12 @@ int main(int argc, char *argv[])
 		return 1;
 	}
 
+	// Initializes a critical section (mutex-like mechanism) to guard access to shared resources like cache.
 	InitializeCriticalSection(&cache_lock);
 
 	if (argc == 2)
 	{
-		port_number = atoi(argv[1]);
+		port_number = atoi(argv[1]); // Reads port number from command line.
 	}
 	else
 	{
@@ -578,6 +643,9 @@ int main(int argc, char *argv[])
 
 	printf("Setting Proxy Server Port : %d\n", port_number);
 
+	/* The below stuffs is kinda old school , but a better method can be using `getaddrinfo` for resolving addresses. See the notes for better one*/
+
+	// Create a TCP socket for the proxy server.
 	proxy_socketId = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
 	if (proxy_socketId == INVALID_SOCKET)
 	{
@@ -586,17 +654,21 @@ int main(int argc, char *argv[])
 		return 1;
 	}
 
+	// Allow reusing the same port immediately after the server closes, avoiding the "Address in use" error.
 	int reuse = 1;
 	if (setsockopt(proxy_socketId, SOL_SOCKET, SO_REUSEADDR, (const char *)&reuse, sizeof(reuse)) == SOCKET_ERROR)
 	{
 		printf("setsockopt failed: %d\n", WSAGetLastError());
 	}
 
+	// Prepare the server address structure.
+	// This structure will be used to bind the socket to a specific port.
 	ZeroMemory(&server_addr, sizeof(server_addr));
 	server_addr.sin_family = AF_INET;
 	server_addr.sin_port = htons(port_number);
 	server_addr.sin_addr.s_addr = INADDR_ANY;
 
+	// Bind the socket to the specified port.
 	if (bind(proxy_socketId, (struct sockaddr *)&server_addr, sizeof(server_addr)) == SOCKET_ERROR)
 	{
 		printf("Port is not free: %d\n", WSAGetLastError());
@@ -607,6 +679,7 @@ int main(int argc, char *argv[])
 
 	printf("Binding on port: %d\n", port_number);
 
+	// Tells socket to start listening for connections (backlog = MAX_CLIENTS)
 	if (listen(proxy_socketId, MAX_CLIENTS) == SOCKET_ERROR)
 	{
 		printf("Error while Listening: %d\n", WSAGetLastError());
@@ -615,14 +688,18 @@ int main(int argc, char *argv[])
 		return 1;
 	}
 
-	int i = 0;
-	SOCKET Connected_socketId[MAX_CLIENTS];
+	int i = 0;								// Index for storing connected client sockets
+	SOCKET Connected_socketId[MAX_CLIENTS]; // Array to store client sockets (1 per thread).
 
+	// Accepts an incoming client connection.
 	while (1)
 	{
 		ZeroMemory(&client_addr, sizeof(client_addr));
 		client_len = sizeof(client_addr);
 
+		// accept() blocks until a client connects to the proxy server.
+		// It returns a new socket descriptor for the accepted connection.
+		// see the notes for better way to use `accept` with `getaddrinfo`.
 		client_socketId = accept(proxy_socketId, (struct sockaddr *)&client_addr, &client_len);
 		if (client_socketId == INVALID_SOCKET)
 		{
@@ -630,12 +707,18 @@ int main(int argc, char *argv[])
 			continue;
 		}
 
+		// Save the accepted client socket to the array.
 		Connected_socketId[i] = client_socketId;
 
+		// Print the client port number and IP address. Since the client_addr is of type sockaddr, we need to cast it to sockaddr_in to access the port and IP address.
+		// inet_ntoa() converts the IP address from binary to a string format.
 		struct sockaddr_in *client_pt = (struct sockaddr_in *)&client_addr;
 		char *ip_str = inet_ntoa(client_addr.sin_addr);
 		printf("Client is connected with port number: %d and ip address: %s\n", ntohs(client_addr.sin_port), ip_str);
 
+		// Creates a new thread and passes a pointer to the client socket.
+		// thread_fn is the function that handles communication with this client.
+		// passes the address of Connected_socketId[i] as a parameter to the thread function (thread_fn).
 		thread_handles[i] = CreateThread(NULL, 0, thread_fn, &Connected_socketId[i], 0, NULL);
 		if (thread_handles[i] == NULL)
 		{
@@ -644,9 +727,11 @@ int main(int argc, char *argv[])
 			continue;
 		}
 
+		// Round-robin assignment of client slots and thread handles.
 		i = (i + 1) % MAX_CLIENTS;
 	}
 
+	// Cleanup code: never actually reached unless you break the loop.
 	closesocket(proxy_socketId);
 	DeleteCriticalSection(&cache_lock);
 	CloseHandle(semaphore);

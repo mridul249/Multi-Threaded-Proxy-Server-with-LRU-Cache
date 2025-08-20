@@ -34,7 +34,7 @@ struct ParsedRequest
 {
    char *method;
    char *protocol;
-   char *host;
+   char *host; 
    char *port;
    char *path;
    char *version;
