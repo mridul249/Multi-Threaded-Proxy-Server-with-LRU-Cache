@@ -1,9 +1,0 @@
-{
-    "files.associations": {
-        "*.ejs": "html",
-        "types.h": "c",
-        "winsock2.h": "c",
-        "proxy_parse.h": "c",
-        "ws2tcpip.h": "c"
-    }
-}
