@@ -615,8 +615,8 @@ int main(int argc, char *argv[])
 		return 1;
 	}
 
-	'''	// Set server as running
-	server_running = 1;
+	// Set server as running
+	int server_running = 1;
 
 	int i = 0;								// Index for storing connected client sockets
 	SOCKET Connected_socketId[MAX_CLIENTS]; // Array to store client sockets (1 per thread).
@@ -625,7 +625,7 @@ int main(int argc, char *argv[])
 	while (server_running)
 	{
 		ZeroMemory(&client_addr, sizeof(client_addr));
-		client_len = sizeof(client_addr);'''
+		client_len = sizeof(client_addr);
 
 		client_socketId = accept(proxy_socketId, (struct sockaddr *)&client_addr, &client_len);
 		if (client_socketId == INVALID_SOCKET)
